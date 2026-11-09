@@ -1,0 +1,4 @@
+[submodule "wireguard-go"]
+	path = wireguard-go
+	url = https://github.com/WireGuard/wireguard-go.git
+	ignore = dirty

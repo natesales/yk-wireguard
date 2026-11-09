@@ -1,0 +1,31 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      - name: Apply wireguard-go patch
+        run: ./sync-wireguard.sh
+
+      - name: Test
+        run: CGO_ENABLED=0 go test ./...
+
+      - name: Build
+        run: CGO_ENABLED=0 go build -o yk-wireguard .

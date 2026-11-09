@@ -1,0 +1,300 @@
+diff --git a/device/device.go b/device/device.go
+index 6854ed8..c012170 100644
+--- a/device/device.go
++++ b/device/device.go
+@@ -51,6 +51,9 @@ type Device struct {
+ 		sync.RWMutex
+ 		privateKey NoisePrivateKey
+ 		publicKey  NoisePublicKey
++		// dh, when set, performs X25519 with the static private key.
++		// The private key itself is not stored.
++		dh StaticDHFunc
+ 	}
+ 
+ 	peers struct {
+@@ -232,7 +235,7 @@ func (device *Device) SetPrivateKey(sk NoisePrivateKey) error {
+ 	device.staticIdentity.Lock()
+ 	defer device.staticIdentity.Unlock()
+ 
+-	if sk.Equals(device.staticIdentity.privateKey) {
++	if device.staticIdentity.dh == nil && sk.Equals(device.staticIdentity.privateKey) {
+ 		return nil
+ 	}
+ 
+@@ -260,6 +263,7 @@ func (device *Device) SetPrivateKey(sk NoisePrivateKey) error {
+ 
+ 	device.staticIdentity.privateKey = sk
+ 	device.staticIdentity.publicKey = publicKey
++	device.staticIdentity.dh = nil
+ 	device.cookieChecker.Init(publicKey)
+ 
+ 	// do static-static DH pre-computations
+@@ -267,7 +271,7 @@ func (device *Device) SetPrivateKey(sk NoisePrivateKey) error {
+ 	expiredPeers := make([]*Peer, 0, len(device.peers.keyMap))
+ 	for _, peer := range device.peers.keyMap {
+ 		handshake := &peer.handshake
+-		handshake.precomputedStaticStatic, _ = device.staticIdentity.privateKey.sharedSecret(handshake.remoteStatic)
++		handshake.precomputedStaticStatic, _ = device.staticSharedSecret(handshake.remoteStatic)
+ 		expiredPeers = append(expiredPeers, peer)
+ 	}
+ 
+diff --git a/device/external_dh_test.go b/device/external_dh_test.go
+new file mode 100644
+index 0000000..2d4489e
+--- /dev/null
++++ b/device/external_dh_test.go
+@@ -0,0 +1,79 @@
++/* SPDX-License-Identifier: MIT
++ *
++ * Copyright (C) 2017-2025 WireGuard LLC. All Rights Reserved.
++ */
++
++package device
++
++import (
++	"bytes"
++	"testing"
++
++	"golang.zx2c4.com/wireguard/conn"
++	"golang.zx2c4.com/wireguard/tun/tuntest"
++)
++
++func TestExternalStaticDHHandshake(t *testing.T) {
++	sk1, err := newPrivateKey()
++	if err != nil {
++		t.Fatal(err)
++	}
++	sk2, err := newPrivateKey()
++	if err != nil {
++		t.Fatal(err)
++	}
++
++	tun1 := tuntest.NewChannelTUN()
++	tun2 := tuntest.NewChannelTUN()
++	logger := NewLogger(LogLevelError, "")
++	dev1 := NewDevice(tun1.TUN(), conn.NewDefaultBind(), logger)
++	dev2 := NewDevice(tun2.TUN(), conn.NewDefaultBind(), logger)
++	defer dev1.Close()
++	defer dev2.Close()
++
++	dev1.SetPrivateKey(sk1)
++	err = dev2.SetExternalStaticKey(sk2.publicKey(), func(peer NoisePublicKey) ([NoisePublicKeySize]byte, error) {
++		return sk2.sharedSecret(peer)
++	})
++	if err != nil {
++		t.Fatal(err)
++	}
++
++	peer1, err := dev2.NewPeer(sk1.publicKey())
++	if err != nil {
++		t.Fatal(err)
++	}
++	peer2, err := dev1.NewPeer(sk2.publicKey())
++	if err != nil {
++		t.Fatal(err)
++	}
++	peer1.Start()
++	peer2.Start()
++
++	if !bytes.Equal(peer1.handshake.precomputedStaticStatic[:], peer2.handshake.precomputedStaticStatic[:]) {
++		t.Fatal("static-static shared secrets differ")
++	}
++
++	msg1, err := dev1.CreateMessageInitiation(peer2)
++	if err != nil {
++		t.Fatal(err)
++	}
++	if got := dev2.ConsumeMessageInitiation(msg1); got == nil {
++		t.Fatal("responder rejected initiation")
++	}
++	msg2, err := dev2.CreateMessageResponse(peer1)
++	if err != nil {
++		t.Fatal(err)
++	}
++	if got := dev1.ConsumeMessageResponse(msg2); got == nil {
++		t.Fatal("initiator rejected response")
++	}
++
++	out, err := dev2.IpcGet()
++	if err != nil {
++		t.Fatal(err)
++	}
++	if bytes.Contains([]byte(out), []byte("private_key=")) {
++		t.Fatalf("external identity leaked a private key:\n%s", out)
++	}
++}
+diff --git a/device/noise-protocol.go b/device/noise-protocol.go
+index a0aca36..58bb5a1 100644
+--- a/device/noise-protocol.go
++++ b/device/noise-protocol.go
+@@ -357,7 +357,7 @@ func (device *Device) ConsumeMessageInitiation(msg *MessageInitiation) *Peer {
+ 	// decrypt static key
+ 	var peerPK NoisePublicKey
+ 	var key [chacha20poly1305.KeySize]byte
+-	ss, err := device.staticIdentity.privateKey.sharedSecret(msg.Ephemeral)
++	ss, err := device.staticSharedSecret(msg.Ephemeral)
+ 	if err != nil {
+ 		return nil
+ 	}
+@@ -555,7 +555,7 @@ func (device *Device) ConsumeMessageResponse(msg *MessageResponse) (peer *Peer)
+ 		mixKey(&chainKey, &chainKey, ss[:])
+ 		setZero(ss[:])
+ 
+-		ss, err = device.staticIdentity.privateKey.sharedSecret(msg.Ephemeral)
++		ss, err = device.staticSharedSecret(msg.Ephemeral)
+ 		if err != nil {
+ 			return false
+ 		}
+diff --git a/device/peer.go b/device/peer.go
+index ebf25f9..3975818 100644
+--- a/device/peer.go
++++ b/device/peer.go
+@@ -75,6 +75,18 @@ func (device *Device) NewPeer(pk NoisePublicKey) (*Peer, error) {
+ 		return nil, errors.New("too many peers")
+ 	}
+ 
++	// map public key
++	_, ok := device.peers.keyMap[pk]
++	if ok {
++		return nil, errors.New("adding existing peer")
++	}
++
++	// pre-compute DH before the peer is published
++	ss, err := device.staticSharedSecret(pk)
++	if err != nil {
++		return nil, err
++	}
++
+ 	// create peer
+ 	peer := new(Peer)
+ 
+@@ -83,17 +95,9 @@ func (device *Device) NewPeer(pk NoisePublicKey) (*Peer, error) {
+ 	peer.queue.outbound = newAutodrainingOutboundQueue(device)
+ 	peer.queue.inbound = newAutodrainingInboundQueue(device)
+ 	peer.queue.staged = make(chan *QueueOutboundElementsContainer, QueueStagedSize)
+-
+-	// map public key
+-	_, ok := device.peers.keyMap[pk]
+-	if ok {
+-		return nil, errors.New("adding existing peer")
+-	}
+-
+-	// pre-compute DH
+ 	handshake := &peer.handshake
+ 	handshake.mutex.Lock()
+-	handshake.precomputedStaticStatic, _ = device.staticIdentity.privateKey.sharedSecret(pk)
++	handshake.precomputedStaticStatic = ss
+ 	handshake.remoteStatic = pk
+ 	handshake.mutex.Unlock()
+ 
+diff --git a/device/staticdh.go b/device/staticdh.go
+new file mode 100644
+index 0000000..ea18774
+--- /dev/null
++++ b/device/staticdh.go
+@@ -0,0 +1,105 @@
++/* SPDX-License-Identifier: MIT
++ *
++ * Copyright (C) 2017-2025 WireGuard LLC. All Rights Reserved.
++ */
++
++package device
++
++import "errors"
++
++// StaticDHFunc computes X25519(staticPrivate, peerPublic) for the device
++// identity. The static private key never enters this process.
++type StaticDHFunc func(peerPublic NoisePublicKey) ([NoisePublicKeySize]byte, error)
++
++// SetExternalStaticKey installs a long-term public key whose matching private
++// key lives outside the process. dh is called for every static Diffie-Hellman,
++// including the static-static value cached when a peer is added.
++func (device *Device) SetExternalStaticKey(publicKey NoisePublicKey, dh StaticDHFunc) error {
++	if dh == nil {
++		return errors.New("external static key requires a DH function")
++	}
++	if publicKey.IsZero() {
++		return errors.New("external static key requires a public key")
++	}
++
++	device.staticIdentity.Lock()
++	defer device.staticIdentity.Unlock()
++
++	device.peers.Lock()
++	defer device.peers.Unlock()
++
++	lockedPeers := make([]*Peer, 0, len(device.peers.keyMap))
++	for _, peer := range device.peers.keyMap {
++		peer.handshake.mutex.RLock()
++		lockedPeers = append(lockedPeers, peer)
++	}
++	unlock := true
++	defer func() {
++		if unlock {
++			for _, peer := range lockedPeers {
++				peer.handshake.mutex.RUnlock()
++			}
++		}
++	}()
++
++	for key, peer := range device.peers.keyMap {
++		if peer.handshake.remoteStatic.Equals(publicKey) {
++			peer.handshake.mutex.RUnlock()
++			removePeerLocked(device, peer, key)
++			peer.handshake.mutex.RLock()
++		}
++	}
++
++	type computed struct {
++		peer *Peer
++		ss   [NoisePublicKeySize]byte
++	}
++	fresh := make([]computed, 0, len(device.peers.keyMap))
++	for _, peer := range device.peers.keyMap {
++		ss, err := dh(peer.handshake.remoteStatic)
++		if err != nil {
++			return err
++		}
++		if isZero(ss[:]) {
++			return errInvalidPublicKey
++		}
++		fresh = append(fresh, computed{peer, ss})
++	}
++
++	device.staticIdentity.privateKey = NoisePrivateKey{}
++	device.staticIdentity.publicKey = publicKey
++	device.staticIdentity.dh = dh
++	device.cookieChecker.Init(publicKey)
++
++	expiredPeers := make([]*Peer, 0, len(fresh))
++	for _, item := range fresh {
++		item.peer.handshake.precomputedStaticStatic = item.ss
++		expiredPeers = append(expiredPeers, item.peer)
++	}
++
++	unlock = false
++	for _, peer := range lockedPeers {
++		peer.handshake.mutex.RUnlock()
++	}
++	for _, peer := range expiredPeers {
++		peer.ExpireCurrentKeypairs()
++	}
++	return nil
++}
++
++// staticSharedSecret uses the external DH function when one is installed.
++// The caller holds staticIdentity's lock.
++func (device *Device) staticSharedSecret(pk NoisePublicKey) ([NoisePublicKeySize]byte, error) {
++	if device.staticIdentity.dh != nil {
++		ss, err := device.staticIdentity.dh(pk)
++		if err != nil {
++			var zero [NoisePublicKeySize]byte
++			return zero, err
++		}
++		if isZero(ss[:]) {
++			return ss, errInvalidPublicKey
++		}
++		return ss, nil
++	}
++	return device.staticIdentity.privateKey.sharedSecret(pk)
++}
